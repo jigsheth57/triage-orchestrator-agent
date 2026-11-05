@@ -1,0 +1,19 @@
+---
+applications:
+  # ============================================================================
+  # 3. Triage Orchestration Agent (Ingress / Doctor Gateway)
+  # ============================================================================
+  - name: triage-orchestrator-agent
+    path: ./target/triage-orchestrator-agent-1.0.0.jar
+    buildpacks:
+      - java_buildpack_offline
+    memory: 1G
+    instances: 1
+    random-route: true
+    services:
+      - clinical-llm
+    env:
+      SPRING_PROFILES_ACTIVE: tanzu
+      JBP_CONFIG_OPEN_JDK_JRE: '{ jre: { version: 17.+ } }'
+      # Direct internal container networking URL for A2A
+      A2A_PHARMACIST_AGENT_URL: http://pharmacist-agent.apps.internal:8080

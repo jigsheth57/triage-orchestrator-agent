@@ -1,0 +1,21 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: triage-orchestrator-agent
+  ai:
+    # Tanzu AI Services (clinical-llm) automatically binds via Spring Cloud Bindings
+    # and populates standard Spring AI OpenAI-compatible properties.
+    # Fallback mappings for explicit VCAP_SERVICES inspection:
+    openai:
+      base-url: ${vcap.services.clinical-llm.credentials.uri:${vcap.services.clinical-llm.credentials.endpoint:http://localhost:11434}}
+      api-key: ${vcap.services.clinical-llm.credentials.api-key:${vcap.services.clinical-llm.credentials.token:default-key}}
+      chat:
+        options:
+          model: ${vcap.services.clinical-llm.credentials.model:llama3.2}
+          temperature: 0.2
+
+a2a:
+  # Internal container-to-container DNS route on Tanzu Platform
+  pharmacist-agent-url: ${A2A_PHARMACIST_AGENT_URL:http://pharmacist-agent.apps.internal:8080}
