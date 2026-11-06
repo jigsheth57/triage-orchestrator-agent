@@ -4,7 +4,6 @@ import com.healthcare.demo.shared.*;
 import com.healthcare.demo.shared.Contracts.*;
 import com.healthcare.demo.triage.casework.ReviewModels.*;
 import com.healthcare.demo.triage.workflow.ReviewFlow;
-import jakarta.annotation.PreDestroy;
 import jakarta.validation.Valid;
 import java.util.*;
 import java.util.concurrent.*;
@@ -24,14 +23,18 @@ public class ReviewController {
   private final ReviewStore store;
   private final ReviewFlow flow;
   private final String model;
-  private final ExecutorService streams =
-      new ThreadPoolExecutor(0, 16, 30, TimeUnit.SECONDS, new SynchronousQueue<>());
+  private final ExecutorService streams;
 
   public ReviewController(
-      ReviewStore store, ReviewFlow flow, @Value("${demo.model}") String model) {
+      ReviewStore store,
+      ReviewFlow flow,
+      @Value("${demo.model}") String model,
+      @org.springframework.beans.factory.annotation.Qualifier("reviewStreams")
+          ExecutorService streams) {
     this.store = store;
     this.flow = flow;
     this.model = model;
+    this.streams = streams;
   }
 
   @GetMapping("/api/session")
@@ -161,6 +164,12 @@ public class ReviewController {
         var run = store.get(actor, id);
         emitter.send(SseEmitter.event().name("review").data(run));
         if (!Set.of("QUEUED", "RUNNING").contains(run.state())) {
+          // Read again after seeing terminal state: completion can race the first event query.
+          for (var event : store.events(actor, id, cursor)) {
+            emitter.send(
+                SseEmitter.event().id(String.valueOf(event.id())).name("activity").data(event));
+            cursor = event.id();
+          }
           emitter.complete();
           return;
         }
@@ -180,10 +189,5 @@ public class ReviewController {
         .body(
             "This demo now uses the live /api/reviews workflow. See README.md for the new"
                 + " contract.");
-  }
-
-  @PreDestroy
-  public void stop() {
-    streams.shutdownNow();
   }
 }

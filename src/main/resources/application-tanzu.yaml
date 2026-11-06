@@ -1,4 +1,22 @@
-# Supply all private service URLs, database credentials and identity configuration explicitly.
+# Single-instance CF template. Explicit bindings are validated before application startup.
 server:
   address: 0.0.0.0
   port: ${PORT:8080}
+  forward-headers-strategy: framework
+  servlet:
+    session:
+      cookie:
+        secure: true
+spring:
+  flyway:
+    enabled: false
+  ai:
+    model:
+      chat: none
+      embedding: none
+demo:
+  provider: openai
+  mcp-url: ${DEMO_MCP_URL}
+  pharmacist-url: ${DEMO_PHARMACIST_URL}
+  guidance-url: ${DEMO_GUIDANCE_URL}
+  care-url: ${DEMO_CARE_URL}

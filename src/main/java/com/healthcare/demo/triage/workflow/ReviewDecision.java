@@ -20,10 +20,20 @@ public final class ReviewDecision {
         || guidance.evidence().isEmpty()
         || care == null
         || care.modelUsage() == null) return Readiness.INCOMPLETE;
+    if (!sameContext(safety, guidance)
+        || !sameContext(safety, care)
+        || care.revision() != safety.revision()
+        || guidance.revision() > safety.revision()) return Readiness.INCOMPLETE;
     if (!"true".equals(care.details().get("covered"))
         || care.details().getOrDefault("followup", "").isBlank()) return Readiness.REVIEW_REQUIRED;
     if (safety.findings().stream().anyMatch(f -> f.severity().equals("REVIEW")))
       return Readiness.REVIEW_REQUIRED;
     return Readiness.READY_FOR_CLINICIAN_REVIEW;
+  }
+
+  private static boolean sameContext(SpecialistResult first, SpecialistResult second) {
+    return java.util.Objects.equals(first.caseId(), second.caseId())
+        && java.util.Objects.equals(first.patientId(), second.patientId())
+        && java.util.Objects.equals(first.snapshotVersion(), second.snapshotVersion());
   }
 }

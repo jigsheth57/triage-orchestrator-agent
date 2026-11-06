@@ -38,10 +38,25 @@ public class SecurityConfiguration {
   SecurityFilterChain webSecurity(HttpSecurity http) throws Exception {
     http.authorizeHttpRequests(
             auth ->
-                auth.requestMatchers("/health", "/api/session", "/api/login")
+                auth.dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ERROR)
+                    .permitAll()
+                    .requestMatchers(
+                        "/",
+                        "/index.html",
+                        "/assets/**",
+                        "/favicon.ico",
+                        "/health",
+                        "/actuator/health",
+                        "/actuator/health/**",
+                        "/api/session",
+                        "/api/login")
                     .permitAll()
                     .anyRequest()
                     .authenticated())
+        .requestCache(
+            cache ->
+                cache.requestCache(
+                    new org.springframework.security.web.savedrequest.NullRequestCache()))
         .csrf(
             csrf ->
                 csrf.csrfTokenRepository(new HttpSessionCsrfTokenRepository())

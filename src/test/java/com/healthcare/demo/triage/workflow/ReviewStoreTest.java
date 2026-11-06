@@ -27,7 +27,8 @@ class ReviewStoreTest {
             "");
     new ResourceDatabasePopulator(
             new ClassPathResource("db/demo/V1__demo_schema.sql"),
-            new ClassPathResource("db/demo/V3__review_request_fingerprint.sql"))
+            new ClassPathResource("db/demo/V3__review_request_fingerprint.sql"),
+            new ClassPathResource("db/demo/V4__execution_leases.sql"))
         .execute(ds);
     jdbc = new JdbcTemplate(ds);
     jdbc.update(
@@ -72,6 +73,7 @@ class ReviewStoreTest {
   @Test
   void aNewFactInvalidatesThePreviousApproval() {
     var run = store.create("clinician", request("approve"));
+    store.claim(run.id());
     store.recordSnapshot(run.id(), "EHR-v7");
     store.finish(
         run.id(),
@@ -96,6 +98,7 @@ class ReviewStoreTest {
   @Test
   void anIncompleteResultCannotBeApproved() {
     var run = store.create("clinician", request("incomplete"));
+    store.claim(run.id());
     store.recordSnapshot(run.id(), "EHR-v7");
     store.finish(
         run.id(),

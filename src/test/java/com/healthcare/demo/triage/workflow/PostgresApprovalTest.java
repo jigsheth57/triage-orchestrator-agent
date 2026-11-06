@@ -31,6 +31,7 @@ class PostgresApprovalTest {
             "clinician",
             new StartRequest(
                 "P101", "Test", "Amoxicillin", null, null, UUID.randomUUID().toString()));
+    store.claim(run.id());
     store.recordSnapshot(run.id(), "EHR-v7");
     // Read the fixture version rather than assuming the seed was never edited.
     String version =

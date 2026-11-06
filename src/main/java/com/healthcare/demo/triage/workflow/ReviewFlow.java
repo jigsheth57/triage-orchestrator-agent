@@ -4,10 +4,9 @@ import com.healthcare.demo.shared.*;
 import com.healthcare.demo.shared.Contracts.*;
 import com.healthcare.demo.triage.casework.*;
 import com.healthcare.demo.triage.casework.ReviewModels.*;
-import jakarta.annotation.PreDestroy;
 import java.util.*;
 import java.util.concurrent.*;
-import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -18,18 +17,22 @@ public class ReviewFlow {
   private final CapabilityTokens permissions;
   private final A2aClient agents;
   private final ModelAssessment model;
+  private final McpAccessFactory toolsFactory;
   private final String toolsUrl;
   private final A2aClient.Agent pharmacist, guidance, care;
-  private final ExecutorService jobs =
-      new ThreadPoolExecutor(2, 2, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(16));
-  private final ExecutorService consultations = Executors.newFixedThreadPool(4);
-  private final ScheduledExecutorService deadlines = Executors.newSingleThreadScheduledExecutor();
+  private final ExecutorService jobs;
+  private final ExecutorService consultations;
+  private final ScheduledExecutorService deadlines;
 
   public ReviewFlow(
       ReviewStore store,
       CapabilityTokens permissions,
-      ChatClient.Builder builder,
-      @Value("${demo.model}") String modelName,
+      A2aClient agents,
+      ModelAssessment model,
+      McpAccessFactory toolsFactory,
+      @Qualifier("reviewJobs") ExecutorService jobs,
+      @Qualifier("reviewConsultations") ExecutorService consultations,
+      @Qualifier("reviewDeadlines") ScheduledExecutorService deadlines,
       @Value("${demo.mcp-url}") String toolsUrl,
       @Value("${demo.pharmacist-url}") String pharmacistUrl,
       @Value("${demo.guidance-url}") String guidanceUrl,
@@ -37,8 +40,23 @@ public class ReviewFlow {
     this.store = store;
     this.permissions = permissions;
     this.toolsUrl = toolsUrl;
-    this.agents = new A2aClient(permissions);
-    this.model = new ModelAssessment(builder, modelName);
+    this.toolsFactory = toolsFactory;
+    this.agents = agents;
+    this.model = model;
+    this.jobs = jobs;
+    this.consultations = consultations;
+    this.deadlines = deadlines;
+    deadlines.scheduleWithFixedDelay(
+        () -> {
+          try {
+            store.maintainLeases();
+          } catch (org.springframework.dao.DataAccessException unavailable) {
+            /* Lease expiry fences work during outages. */
+          }
+        },
+        0,
+        10,
+        TimeUnit.SECONDS);
     pharmacist =
         new A2aClient.Agent(
             "pharmacist",
@@ -49,30 +67,53 @@ public class ReviewFlow {
         new A2aClient.Agent(
             "guidance", guidanceUrl, "clinical-guidance", List.of("searchPolicies"));
     care = new A2aClient.Agent("care", careUrl, "care-feasibility", List.of("getCareOptions"));
-    store.interruptUnfinished();
   }
 
   public void start(Run run) {
     if (!store.claim(run.id())) return;
+    var timeout =
+        deadlines.schedule(
+            () -> expire(run),
+            Math.max(
+                0,
+                90_000
+                    - java.time.Duration.between(run.createdAt(), java.time.Instant.now())
+                        .toMillis()),
+            TimeUnit.MILLISECONDS);
     try {
-      jobs.submit(() -> execute(run));
+      jobs.submit(
+          () -> {
+            try {
+              execute(run);
+            } finally {
+              timeout.cancel(false);
+            }
+          });
     } catch (RejectedExecutionException e) {
+      timeout.cancel(false);
+      var empty =
+          OutcomePresentation.result(
+              run.input(), List.of(run.input()), List.of(), Readiness.INCOMPLETE, 0);
       store.finish(
           run.id(),
           new Result(
-              Readiness.INCOMPLETE,
-              run.input().proposedTreatment(),
-              List.of(),
-              List.of(),
-              List.of(),
+              empty.readiness(),
+              empty.selectedTreatment(),
+              empty.reviews(),
+              empty.findings(),
+              empty.evidence(),
               "The demo is busy. Retry when another review finishes.",
-              0));
+              0,
+              empty.originalTreatment(),
+              empty.attempts(),
+              empty.observations(),
+              "Retry after another review finishes. Approval is unavailable."));
     }
   }
 
   public List<PatientSummary> patients(String actor) {
     String token = permissions.issue(actor, "catalog", "*", 0, "mcp", List.of("listDemoPatients"));
-    try (var tools = new McpAccess(toolsUrl, token, new ActivityLog(events -> {}))) {
+    try (var tools = toolsFactory.open(toolsUrl, token, new ActivityLog(events -> {}))) {
       var all = tools.call("listDemoPatients", Map.of(), PatientSummary[].class);
       return Arrays.stream(all)
           .filter(
@@ -93,34 +134,31 @@ public class ReviewFlow {
     String token =
         permissions.issue(
             actor, "chart-preview", patientId, 0, "mcp", List.of("getPatientSnapshot"));
-    try (var tools = new McpAccess(toolsUrl, token, new ActivityLog(events -> {}))) {
+    try (var tools = toolsFactory.open(toolsUrl, token, new ActivityLog(events -> {}))) {
       return tools.call(
           "getPatientSnapshot", Map.of("patientId", patientId), PatientSnapshot.class);
     }
   }
 
   private void execute(Run initial) {
-    long started = System.nanoTime(), deadline = started + TimeUnit.SECONDS.toNanos(90);
+    long started = System.nanoTime();
+    long remainingMs =
+        Math.max(
+            0,
+            90_000
+                - java.time.Duration.between(initial.createdAt(), java.time.Instant.now())
+                    .toMillis());
+    long deadline = started + TimeUnit.MILLISECONDS.toNanos(remainingMs);
     var reviews = new ArrayList<SpecialistResult>();
-    var timeout =
-        deadlines.schedule(
-            () -> {
-              if (store.active(initial.id()))
-                store.finish(
-                    initial.id(),
-                    new Result(
-                        Readiness.INCOMPLETE,
-                        initial.input().proposedTreatment(),
-                        List.of(),
-                        List.of(),
-                        List.of(),
-                        "Review exceeded its 90-second deadline. Inspect service status and retry.",
-                        90_000));
-            },
-            90,
-            TimeUnit.SECONDS);
+    var inputs = new ArrayList<ReviewInput>();
     try {
+      requireActive(initial.id(), deadline);
       var input = loadPatient(initial);
+      inputs.add(input);
+      store.progress(
+          initial.id(),
+          OutcomePresentation.result(
+              initial.input(), inputs, reviews, Readiness.INCOMPLETE, elapsed(started)));
       store.stage(initial.id(), "Pharmacist and guidance reviews");
       var firstInput = input;
       var safetyFuture =
@@ -131,10 +169,14 @@ public class ReviewFlow {
               () -> consult(initial, firstInput, guidance, deadline), consultations);
       var safety = safetyFuture.join();
       reviews.add(safety);
-      publishAssessment(initial, safety, "Pharmacist finding received");
+      publishAssessment(initial, firstInput, safety, "Pharmacist finding received");
       var advice = guidanceFuture.join();
       reviews.add(advice);
-      publishAssessment(initial, advice, "Guidance evidence received");
+      publishAssessment(initial, firstInput, advice, "Guidance evidence received");
+      store.progress(
+          initial.id(),
+          OutcomePresentation.result(
+              initial.input(), inputs, reviews, Readiness.INCOMPLETE, elapsed(started)));
       String selected = input.proposedTreatment();
       SpecialistResult feasibility = null;
       String originalDrug = safety.details().get("drug");
@@ -154,7 +196,7 @@ public class ReviewFlow {
           store.stage(initial.id(), "Coverage and follow-up review");
           feasibility = consult(initial, input, care, deadline);
           reviews.add(feasibility);
-          publishAssessment(initial, feasibility, "Care options received");
+          publishAssessment(initial, input, feasibility, "Care options received");
           if ("true".equals(feasibility.details().get("covered"))) break;
         }
         if (candidates.isEmpty() || revisions >= 2) break;
@@ -162,6 +204,11 @@ public class ReviewFlow {
         revisions++;
         input = store.selectCandidate(initial.actor(), initial.id(), candidate);
         selected = candidate;
+        inputs.add(input);
+        store.progress(
+            initial.id(),
+            OutcomePresentation.result(
+                initial.input(), inputs, reviews, Readiness.INCOMPLETE, elapsed(started)));
         store.event(
             initial.id(),
             "HANDOFF",
@@ -172,11 +219,16 @@ public class ReviewFlow {
         safety = consult(initial, input, pharmacist, deadline);
         reviews.add(safety);
         feasibility = null;
-        publishAssessment(initial, safety, "Revised candidate safety review received");
-        store.progress(initial.id(), partial(selected, reviews, safety, started));
+        publishAssessment(initial, input, safety, "Revised candidate safety review received");
+        store.progress(
+            initial.id(),
+            OutcomePresentation.result(
+                initial.input(), inputs, reviews, Readiness.INCOMPLETE, elapsed(started)));
       }
       var readiness = ReviewDecision.decide(safety, advice, feasibility);
-      var sources = uniqueEvidence(reviews);
+      var sources =
+          OutcomePresentation.result(initial.input(), inputs, reviews, readiness, elapsed(started))
+              .evidence();
       String summary =
           "Required demonstration checks are "
               + readiness.name().toLowerCase(Locale.ROOT).replace('_', ' ')
@@ -209,7 +261,7 @@ public class ReviewFlow {
                 sources,
                 log);
         requireActive(initial.id(), deadline);
-        summary = reply.assessment().summary();
+        String commentary = reply.assessment().summary();
         reviews.add(
             new SpecialistResult(
                 "coordinator",
@@ -217,7 +269,7 @@ public class ReviewFlow {
                 input.patientId(),
                 input.revision(),
                 input.snapshotVersion(),
-                summary,
+                commentary,
                 List.of(),
                 sources,
                 List.of(),
@@ -228,14 +280,8 @@ public class ReviewFlow {
       requireActive(initial.id(), deadline);
       store.finish(
           initial.id(),
-          new Result(
-              readiness,
-              selected,
-              List.copyOf(reviews),
-              safety.findings(),
-              sources,
-              summary,
-              elapsed(started)));
+          OutcomePresentation.result(
+              initial.input(), inputs, reviews, readiness, elapsed(started)));
     } catch (Exception e) {
       if (store.active(initial.id())) {
         store.event(
@@ -248,21 +294,50 @@ public class ReviewFlow {
                     ? e.getCause().getClass().getSimpleName()
                     : e.getClass().getSimpleName()),
             0);
-        store.finish(
-            initial.id(),
-            new Result(
-                Readiness.INCOMPLETE,
-                initial.input().proposedTreatment(),
-                List.copyOf(reviews),
-                List.of(),
-                uniqueEvidence(reviews),
-                "A required tool, specialist, evidence check or model response could not complete."
-                    + " No approval is available. Check the step details and retry.",
-                elapsed(started)));
+        if (inputs.isEmpty()) inputs.add(initial.input());
+        var failure =
+            OutcomePresentation.result(
+                initial.input(), inputs, reviews, Readiness.INCOMPLETE, elapsed(started));
+        store.finish(initial.id(), failure);
       }
-    } finally {
-      timeout.cancel(false);
     }
+  }
+
+  private void expire(Run initial) {
+    if (!store.active(initial.id())) return;
+    var current = store.get(initial.actor(), initial.id());
+    var partial = current.result();
+    if (partial == null) {
+      partial =
+          OutcomePresentation.result(
+              initial.input(), List.of(initial.input()), List.of(), Readiness.INCOMPLETE, 90_000);
+    }
+    String action =
+        "The 90-second review deadline expired, including queue wait. Start a fresh review after"
+            + " checking service status. Approval is unavailable.";
+    var attempts =
+        partial.attempts().stream()
+            .map(
+                a ->
+                    a.disposition().equals("SELECTED")
+                        ? new ProposalAttempt(
+                            a.revision(), a.treatment(), "INCOMPLETE", action, a.checks())
+                        : a)
+            .toList();
+    store.finish(
+        initial.id(),
+        new Result(
+            Readiness.INCOMPLETE,
+            partial.selectedTreatment(),
+            partial.reviews(),
+            partial.findings(),
+            partial.evidence(),
+            partial.selectedTreatment() + ": " + action,
+            90_000,
+            partial.originalTreatment(),
+            attempts,
+            partial.observations(),
+            action));
   }
 
   private ReviewInput loadPatient(Run run) {
@@ -275,7 +350,7 @@ public class ReviewFlow {
             run.revision(),
             "mcp",
             List.of("getPatientSnapshot"));
-    try (var tools = new McpAccess(toolsUrl, token, activityLog(run, "coordinator"))) {
+    try (var tools = toolsFactory.open(toolsUrl, token, activityLog(run, "coordinator"))) {
       var patient =
           tools.call(
               "getPatientSnapshot",
@@ -300,7 +375,13 @@ public class ReviewFlow {
         run.id(),
         "A2A",
         "Consulting " + agent.name(),
-        Map.of("agent", agent.name(), "revision", input.revision()),
+        Map.of(
+            "agent",
+            agent.name(),
+            "revision",
+            input.revision(),
+            "candidate",
+            input.proposedTreatment()),
         0);
     long started = System.nanoTime();
     var result =
@@ -324,7 +405,9 @@ public class ReviewFlow {
                       "sourceTime",
                       event.at().toString(),
                       "revision",
-                      input.revision()),
+                      input.revision(),
+                      "candidate",
+                      input.proposedTreatment()),
                   event.durationMs());
             },
             () -> store.active(run.id()));
@@ -332,7 +415,13 @@ public class ReviewFlow {
         run.id(),
         "A2A",
         "Consultation completed",
-        Map.of("agent", agent.name(), "revision", input.revision()),
+        Map.of(
+            "agent",
+            agent.name(),
+            "revision",
+            input.revision(),
+            "candidate",
+            input.proposedTreatment()),
         elapsed(started));
     return result;
   }
@@ -352,7 +441,8 @@ public class ReviewFlow {
         });
   }
 
-  private void publishAssessment(Run run, SpecialistResult result, String title) {
+  private void publishAssessment(
+      Run run, ReviewInput input, SpecialistResult result, String title) {
     store.event(
         run.id(),
         "ASSESSMENT",
@@ -367,26 +457,15 @@ public class ReviewFlow {
             "evidence",
             result.evidence(),
             "revision",
-            result.revision()),
+            result.revision(),
+            "candidate",
+            input.proposedTreatment()),
         result.modelUsage() == null ? 0 : result.modelUsage().durationMs());
   }
 
-  private Result partial(
-      String selected, List<SpecialistResult> reviews, SpecialistResult safety, long started) {
-    return new Result(
-        Readiness.INCOMPLETE,
-        selected,
-        List.copyOf(reviews),
-        safety.findings(),
-        uniqueEvidence(reviews),
-        "Review is still running",
-        elapsed(started));
-  }
-
   private List<Evidence> uniqueEvidence(List<SpecialistResult> reviews) {
-    var evidence = new LinkedHashMap<String, Evidence>();
-    for (var r : reviews) for (var e : r.evidence()) evidence.putIfAbsent(e.id(), e);
-    return List.copyOf(evidence.values());
+    // Failure diagnostics preserve every distinct observation instead of collapsing by source ID.
+    return reviews.stream().flatMap(r -> r.evidence().stream()).distinct().toList();
   }
 
   private void requireActive(String id, long deadline) {
@@ -398,10 +477,8 @@ public class ReviewFlow {
     return (System.nanoTime() - start) / 1_000_000;
   }
 
-  @PreDestroy
-  public void stop() {
-    jobs.shutdownNow();
-    consultations.shutdownNow();
-    deadlines.shutdownNow();
+  @jakarta.annotation.PreDestroy
+  public void releaseClaims() {
+    store.releaseOwned();
   }
 }

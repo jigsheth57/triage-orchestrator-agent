@@ -33,7 +33,67 @@ public final class ReviewModels {
       List<Finding> findings,
       List<Evidence> evidence,
       String summary,
-      long durationMs) {}
+      long durationMs,
+      String originalTreatment,
+      List<ProposalAttempt> attempts,
+      List<EvidenceObservation> observations,
+      String nextAction) {
+    public Result {
+      reviews = reviews == null ? List.of() : List.copyOf(reviews);
+      findings = findings == null ? List.of() : List.copyOf(findings);
+      evidence = evidence == null ? List.of() : List.copyOf(evidence);
+      attempts = attempts == null ? List.of() : List.copyOf(attempts);
+      observations = observations == null ? List.of() : List.copyOf(observations);
+    }
+
+    /** Compatibility constructor for legacy persisted outcomes and terminal failure paths. */
+    public Result(
+        Readiness readiness,
+        String selectedTreatment,
+        List<SpecialistResult> reviews,
+        List<Finding> findings,
+        List<Evidence> evidence,
+        String summary,
+        long durationMs) {
+      this(
+          readiness,
+          selectedTreatment,
+          reviews,
+          findings,
+          evidence,
+          summary,
+          durationMs,
+          null,
+          List.of(),
+          List.of(),
+          null);
+    }
+  }
+
+  public record ProposalAttempt(
+      long revision,
+      String treatment,
+      String disposition,
+      String reason,
+      List<AttemptCheck> checks) {}
+
+  public record AttemptCheck(
+      String kind, String status, String outcomeCode, List<String> evidenceObservationIds) {}
+
+  /** A query result has its own identity; the underlying publication keeps its stable source ID. */
+  public record EvidenceObservation(
+      String observationId,
+      String sourceId,
+      String sourceVersion,
+      String caseId,
+      String patientId,
+      long proposalRevision,
+      String snapshotVersion,
+      String treatment,
+      String checkKind,
+      Instant recordedAt,
+      Map<String, String> facts,
+      Evidence source) {}
 
   public record Run(
       String id,

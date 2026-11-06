@@ -15,6 +15,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 @Repository
 public class ReviewStore {
   private final JdbcTemplate jdbc;
+  private final String executionOwner = UUID.randomUUID().toString();
+  private static final String LIVE = " AND execution_owner=? AND lease_until>CURRENT_TIMESTAMP";
   private final TransactionTemplate transactions;
 
   public ReviewStore(JdbcTemplate jdbc, PlatformTransactionManager manager) {
@@ -36,6 +38,23 @@ public class ReviewStore {
   }
 
   public Run create(String actor, StartRequest request) {
+    try {
+      return createTransaction(actor, request);
+    } catch (org.springframework.dao.DuplicateKeyException collision) {
+      // The losing transaction has rolled back before the committed winner is read.
+      var rows =
+          jdbc.queryForList(
+              "SELECT id,request_hash FROM workflow.review_run WHERE actor=? AND idempotency_key=?",
+              actor,
+              request.idempotencyKey());
+      if (rows.isEmpty()) throw collision;
+      if (!fingerprint(request).equals(rows.get(0).get("request_hash")))
+        throw new Conflict("Submission key was already used for different inputs");
+      return get(actor, rows.get(0).get("id").toString());
+    }
+  }
+
+  private Run createTransaction(String actor, StartRequest request) {
     return transactions.execute(
         tx -> {
           requireGrant(actor, request.patientId());
@@ -189,45 +208,60 @@ public class ReviewStore {
   /** Only one submitter may start this persisted job, including after an HTTP retry. */
   public boolean claim(String id) {
     return jdbc.update(
-            "UPDATE workflow.review_run SET state='RUNNING',updated_at=? WHERE id=? AND"
-                + " state='QUEUED'",
+            "UPDATE workflow.review_run SET"
+                + " state='RUNNING',updated_at=?,execution_owner=?,lease_until=CURRENT_TIMESTAMP +"
+                + " INTERVAL '120' SECOND WHERE id=? AND state='QUEUED' AND"
+                + " created_at>CURRENT_TIMESTAMP - INTERVAL '90' SECOND",
             now(),
+            executionOwner,
             id)
         == 1;
   }
 
   public boolean active(String id) {
     return jdbc.queryForObject(
-            "SELECT count(*) FROM workflow.review_run WHERE id=? AND state IN ('QUEUED','RUNNING')",
+            "SELECT count(*) FROM workflow.review_run WHERE id=? AND state='RUNNING'" + LIVE,
             Integer.class,
-            id)
+            id,
+            executionOwner)
         > 0;
   }
 
   public void stage(String id, String stage) {
     jdbc.update(
         "UPDATE workflow.review_run SET state='RUNNING',stage=?,updated_at=? WHERE id=? AND state"
-            + " IN ('QUEUED','RUNNING')",
+            + " IN ('QUEUED','RUNNING')"
+            + LIVE,
         stage,
         now(),
-        id);
+        id,
+        executionOwner);
   }
 
   public void recordSnapshot(String id, String snapshot) {
     jdbc.update(
         "UPDATE workflow.review_run SET snapshot_version=?,updated_at=? WHERE id=? AND state IN"
-            + " ('QUEUED','RUNNING')",
+            + " ('QUEUED','RUNNING')"
+            + LIVE,
         snapshot,
         now(),
-        id);
+        id,
+        executionOwner);
   }
 
   public void rememberPreference(Run run, String preference) {
-    jdbc.update(
-        "UPDATE workflow.case_header SET preference=? WHERE id=? AND preference=''",
-        preference,
-        run.caseId());
-    memory(run.caseId(), "preference", preference, true, "Confirmed synthetic chart preference");
+    transactions.executeWithoutResult(
+        tx -> {
+          caseForUpdate(run.actor(), run.caseId());
+          jdbc.queryForList("SELECT id FROM workflow.review_run WHERE id=? FOR UPDATE", run.id());
+          if (!active(run.id())) throw new Conflict("Execution owner is no longer active");
+          jdbc.update(
+              "UPDATE workflow.case_header SET preference=? WHERE id=? AND preference=''",
+              preference,
+              run.caseId());
+          memory(
+              run.caseId(), "preference", preference, true, "Confirmed synthetic chart preference");
+        });
   }
 
   public ReviewInput selectCandidate(String actor, String id, String candidate) {
@@ -235,6 +269,7 @@ public class ReviewStore {
         tx -> {
           var run = get(actor, id);
           var c = caseForUpdate(actor, run.caseId());
+          jdbc.queryForList("SELECT id FROM workflow.review_run WHERE id=? FOR UPDATE", id);
           if (!active(id) || ((Number) c.get("version")).longValue() != run.revision())
             throw new Conflict("Case changed during the review");
           long next = run.revision() + 1;
@@ -259,33 +294,45 @@ public class ReviewStore {
   public void progress(String id, Result result) {
     jdbc.update(
         "UPDATE workflow.review_run SET result_json=?,updated_at=? WHERE id=? AND state IN"
-            + " ('QUEUED','RUNNING')",
+            + " ('QUEUED','RUNNING')"
+            + LIVE,
         Json.write(result),
         now(),
-        id);
+        id,
+        executionOwner);
   }
 
   public void finish(String id, Result result) {
-    int changed =
-        jdbc.update(
-            "UPDATE workflow.review_run SET result_json=?,state='COMPLETED',stage=?,updated_at=?"
-                + " WHERE id=? AND state IN ('QUEUED','RUNNING')",
-            Json.write(result),
-            result.readiness().name(),
-            now(),
-            id);
-    if (changed > 0)
-      append(
-          id,
-          "RESULT",
-          "Review finished",
-          Map.of("readiness", result.readiness().name()),
-          result.durationMs());
+    transactions.executeWithoutResult(
+        tx -> {
+          int changed =
+              jdbc.update(
+                  "UPDATE workflow.review_run SET"
+                      + " result_json=?,state='COMPLETED',stage=?,updated_at=? WHERE id=? AND state"
+                      + " IN ('QUEUED','RUNNING')"
+                      + LIVE,
+                  Json.write(result),
+                  result.readiness().name(),
+                  now(),
+                  id,
+                  executionOwner);
+          if (changed > 0)
+            append(
+                id,
+                "RESULT",
+                "Review finished",
+                Map.of("readiness", result.readiness().name()),
+                result.durationMs());
+        });
   }
 
   public void event(
       String id, String kind, String message, Map<String, Object> details, long durationMs) {
-    if (active(id)) append(id, kind, message, details, durationMs);
+    transactions.executeWithoutResult(
+        tx -> {
+          jdbc.queryForList("SELECT id FROM workflow.review_run WHERE id=? FOR UPDATE", id);
+          if (active(id)) append(id, kind, message, details, durationMs);
+        });
   }
 
   private void append(
@@ -319,17 +366,20 @@ public class ReviewStore {
   }
 
   public void cancel(String actor, String id) {
-    get(actor, id);
-    int changed =
-        jdbc.update(
-            "UPDATE workflow.review_run SET state='CANCELED',stage='Review canceled',updated_at=?"
-                + " WHERE id=? AND state IN ('QUEUED','RUNNING')",
-            now(),
-            id);
-    if (changed > 0) {
-      append(id, "WORKFLOW", "Review canceled", Map.of(), 0);
-      audit(actor, "REVIEW_CANCELED", id);
-    }
+    transactions.executeWithoutResult(
+        tx -> {
+          get(actor, id);
+          int changed =
+              jdbc.update(
+                  "UPDATE workflow.review_run SET state='CANCELED',stage='Review"
+                      + " canceled',updated_at=? WHERE id=? AND state IN ('QUEUED','RUNNING')",
+                  now(),
+                  id);
+          if (changed > 0) {
+            append(id, "WORKFLOW", "Review canceled", Map.of(), 0);
+            audit(actor, "REVIEW_CANCELED", id);
+          }
+        });
   }
 
   public void approve(String actor, String id, ApprovalRequest request) {
@@ -469,11 +519,35 @@ public class ReviewStore {
         actor);
   }
 
-  public void interruptUnfinished() {
+  /** Renew only this process's live claims; an expired owner cannot renew itself. */
+  public void maintainLeases() {
     jdbc.update(
-        "UPDATE workflow.review_run SET state='INTERRUPTED',stage='Service restarted; start a fresh"
-            + " review',updated_at=? WHERE state IN ('QUEUED','RUNNING')",
-        now());
+        "UPDATE workflow.review_run SET lease_until=CURRENT_TIMESTAMP + INTERVAL '120' SECOND WHERE"
+            + " state='RUNNING'"
+            + LIVE,
+        executionOwner);
+    recoverExpired();
+  }
+
+  public int recoverExpired() {
+    return jdbc.update(
+        "UPDATE workflow.review_run SET state='INTERRUPTED',stage='Execution admission or lease"
+            + " expired; start a fresh review',updated_at=CURRENT_TIMESTAMP WHERE (state='RUNNING'"
+            + " AND lease_until<=CURRENT_TIMESTAMP) OR (state='QUEUED' AND"
+            + " created_at<=CURRENT_TIMESTAMP - INTERVAL '90' SECOND)");
+  }
+
+  /** Compatibility alias; unlike the former implementation this never interrupts a live owner. */
+  public void interruptUnfinished() {
+    recoverExpired();
+  }
+
+  public void releaseOwned() {
+    jdbc.update(
+        "UPDATE workflow.review_run SET state='INTERRUPTED',stage='Execution owner stopped; start a"
+            + " fresh review',updated_at=CURRENT_TIMESTAMP WHERE state='RUNNING' AND"
+            + " execution_owner=?",
+        executionOwner);
   }
 
   private Map<String, Object> caseForRead(String actor, String id) {

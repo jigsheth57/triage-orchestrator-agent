@@ -72,4 +72,58 @@ class ReviewDecisionTest {
                 result("care", List.of(), Map.of("covered", "true", "followup", "Evening option"))))
         .isEqualTo(Readiness.READY_FOR_CLINICIAN_REVIEW);
   }
+
+  @Test
+  void oldCoverageOrAnotherPatientCannotClearARevisedDraft() {
+    var base = result("pharmacist", List.of(), Map.of("supported", "true"));
+    var safety =
+        new SpecialistResult(
+            base.agent(),
+            base.caseId(),
+            base.patientId(),
+            2,
+            base.snapshotVersion(),
+            base.summary(),
+            base.findings(),
+            base.evidence(),
+            base.candidates(),
+            base.details(),
+            base.activities(),
+            base.modelUsage());
+    var oldCare = result("care", List.of(), Map.of("covered", "true", "followup", "visit"));
+    var guidance = result("guidance", List.of(), Map.of());
+    assertThat(ReviewDecision.decide(safety, guidance, oldCare)).isEqualTo(Readiness.INCOMPLETE);
+    var otherPatient =
+        new SpecialistResult(
+            oldCare.agent(),
+            oldCare.caseId(),
+            "P104",
+            2,
+            oldCare.snapshotVersion(),
+            oldCare.summary(),
+            oldCare.findings(),
+            oldCare.evidence(),
+            oldCare.candidates(),
+            oldCare.details(),
+            oldCare.activities(),
+            oldCare.modelUsage());
+    assertThat(ReviewDecision.decide(safety, guidance, otherPatient))
+        .isEqualTo(Readiness.INCOMPLETE);
+    var currentCare =
+        new SpecialistResult(
+            oldCare.agent(),
+            oldCare.caseId(),
+            oldCare.patientId(),
+            2,
+            oldCare.snapshotVersion(),
+            oldCare.summary(),
+            oldCare.findings(),
+            oldCare.evidence(),
+            oldCare.candidates(),
+            oldCare.details(),
+            oldCare.activities(),
+            oldCare.modelUsage());
+    assertThat(ReviewDecision.decide(safety, guidance, currentCare))
+        .isEqualTo(Readiness.READY_FOR_CLINICIAN_REVIEW);
+  }
 }
