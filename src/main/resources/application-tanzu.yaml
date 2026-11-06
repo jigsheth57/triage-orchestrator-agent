@@ -1,21 +1,22 @@
+# Single-instance CF template. Explicit bindings are validated before application startup.
 server:
-  port: 8080
-
+  address: 0.0.0.0
+  port: ${PORT:8080}
+  forward-headers-strategy: framework
+  servlet:
+    session:
+      cookie:
+        secure: true
 spring:
-  application:
-    name: triage-orchestrator-agent
+  flyway:
+    enabled: false
   ai:
-    # Tanzu AI Services (clinical-llm) automatically binds via Spring Cloud Bindings
-    # and populates standard Spring AI OpenAI-compatible properties.
-    # Fallback mappings for explicit VCAP_SERVICES inspection:
-    openai:
-      base-url: ${vcap.services.clinical-llm.credentials.uri:${vcap.services.clinical-llm.credentials.endpoint:http://localhost:11434}}
-      api-key: ${vcap.services.clinical-llm.credentials.api-key:${vcap.services.clinical-llm.credentials.token:default-key}}
-      chat:
-        options:
-          model: ${vcap.services.clinical-llm.credentials.model:llama3.2}
-          temperature: 0.2
-
-a2a:
-  # Internal container-to-container DNS route on Tanzu Platform
-  pharmacist-agent-url: ${A2A_PHARMACIST_AGENT_URL:http://pharmacist-agent.apps.internal:8080}
+    model:
+      chat: none
+      embedding: none
+demo:
+  provider: openai
+  mcp-url: ${DEMO_MCP_URL}
+  pharmacist-url: ${DEMO_PHARMACIST_URL}
+  guidance-url: ${DEMO_GUIDANCE_URL}
+  care-url: ${DEMO_CARE_URL}

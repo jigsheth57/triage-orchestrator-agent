@@ -1,16 +1,64 @@
 server:
-  port: 8080
-
+  address: 127.0.0.1
+  port: ${PORT:8080}
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        same-site: strict
 spring:
   application:
     name: triage-orchestrator-agent
+  datasource:
+    url: ${DEMO_DB_URL:jdbc:postgresql://127.0.0.1:55432/clinical_triage_demo}
+    username: ${DEMO_DB_USER:clinical_demo}
+    password: ${DEMO_DB_PASSWORD}
+  flyway:
+    locations: classpath:db/demo
+  sql:
+    init:
+      mode: never
   ai:
     ollama:
-      base-url: http://localhost:11434
+      base-url: ${OLLAMA_BASE_URL:http://127.0.0.1:11434}
       chat:
         options:
-          model: llama3.2
-          temperature: 0.2
+          model: ${DEMO_MODEL:qwen2.5:7b}
+          temperature: 0.1
+          num-predict: 350
+          num-ctx: 16384
+      embedding:
+        enabled: false
+demo:
+  execution:
+    review-workers: 2
+    review-queue: 16
+    consultation-workers: 4
+    consultation-queue: 32
+    stream-workers: 16
+    connect-timeout: 3s
+    read-timeout: 8s
+  token-secret: ${DEMO_TOKEN_SECRET}
+  login-password: ${DEMO_LOGIN_PASSWORD}
+  model: ${DEMO_MODEL:qwen2.5:7b}
+  mcp-url: ${DEMO_MCP_URL:http://127.0.0.1:8081}
+  pharmacist-url: ${DEMO_PHARMACIST_URL:http://127.0.0.1:8082}
+  guidance-url: ${DEMO_GUIDANCE_URL:http://127.0.0.1:8083}
+  care-url: ${DEMO_CARE_URL:http://127.0.0.1:8084}
 
-a2a:
-  pharmacist-agent-url: http://localhost:8082
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,db
+  tracing:
+    sampling:
+      probability: 1.0
